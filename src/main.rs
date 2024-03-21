@@ -1,14 +1,17 @@
 #![no_std]
 #![no_main]
 
-use core::sync::atomic::{AtomicI16, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use defmt::*;
 use embassy_rp::{bind_interrupts, gpio:: {Pin, AnyPin, Level, Output, Pull}, adc, pwm, peripherals};
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+use embassy_sync::mutex::Mutex;
 use embassy_time::Timer;
 use fixed::traits::ToFixed;
 use {defmt_rtt as _, panic_probe as _};
+use crate::buttons::Button;
 
-mod debouncer;
+mod buttons;
 
 static MODES: [[u16; 2]; 3] = [
     [1000, 2000],
@@ -16,40 +19,35 @@ static MODES: [[u16; 2]; 3] = [
     [500, 2500],
 ];
 
-#[derive(PartialEq)]
-#[derive(Format)]
-enum Button {
-    None,
-    Up,
-    Down,
-    Left,
-    Right,
-    Center,
-}
-
-const ADC_BUTTONS: [(i16, Button); 6] = [
-    (90, Button::Down),
-    (585, Button::Right),
-    (1155, Button::Up),
-    (1835, Button::Left),
-    (2455, Button::Center),
-    (3990, Button::None),
-];
-
-static CURRENT_MODE_INDEX: AtomicU8 = AtomicU8::new(0);
-static LAST_ADC: AtomicI16 = AtomicI16::new(ADC_BUTTONS[5].0);
-
+static CURRENT_MODE_INDEX: AtomicUsize = AtomicUsize::new(0);
+static CURRENT_SIDE_INDEX: AtomicUsize = AtomicUsize::new(0);
+static RUNNING: AtomicBool = AtomicBool::new(true);
 bind_interrupts!(struct Irqs {
     ADC_IRQ_FIFO => adc::InterruptHandler;
 });
+
+type PwmType = Mutex<ThreadModeRawMutex, Option<pwm::Pwm<'static, peripherals::PWM_CH5>>>;
+type PwmConfigType = Mutex<ThreadModeRawMutex, Option<pwm::Config>>;
+static PWM: PwmType = Mutex::new(None);
+static PWM_CONFIG: PwmConfigType = Mutex::new(None);
 
 #[embassy_executor::main]
 async fn main(spawner: embassy_executor::Spawner) {
     let p = embassy_rp::init(Default::default());
 
+    let mut c: pwm::Config = Default::default();
+    c.divider = 125.to_fixed();
+    c.top = 20000;
+    c.compare_b = 1000;
+    let pwm = pwm::Pwm::new_output_b(p.PWM_CH5, p.PIN_27, c.clone());
+    {
+        *(PWM.lock().await) = Some(pwm);
+        *(PWM_CONFIG.lock().await) = Some(c);
+    }
+
     spawner.spawn(run_led(p.PIN_25.degrade())).unwrap();
     spawner.spawn(run_adc(p.PIN_26, p.ADC)).unwrap();
-    spawner.spawn(run_pwm(p.PIN_27, p.PWM_CH5)).unwrap();
+    spawner.spawn(run_pwm()).unwrap();
 }
 
 #[embassy_executor::task]
@@ -57,13 +55,15 @@ async fn run_led(led_pin: AnyPin) {
     let mut led = Output::new(led_pin, Level::Low);
 
     loop {
-        //info!("led on!");
-        led.set_high();
-        Timer::after_secs(1).await;
+        update_pwm().await;
 
-        //info!("led off!");
-        led.set_low();
-        Timer::after_secs(1).await;
+        led.set_high();
+        Timer::after_millis(50).await;
+
+        if RUNNING.load(Ordering::Relaxed) {
+            led.set_low();
+            Timer::after_millis(50).await;
+        }
     }
 }
 
@@ -71,52 +71,52 @@ async fn run_led(led_pin: AnyPin) {
 async fn run_adc(adc_pin: peripherals::PIN_26, p_adc: peripherals::ADC) {
 
     let mut adc = adc::Adc::new(p_adc, Irqs, adc::Config::default());
-
-    let mut p26 = adc::Channel::new_pin(adc_pin, Pull::Up);
+    let mut pin = adc::Channel::new_pin(adc_pin, Pull::Up);
 
     loop {
-        let level = adc.read(&mut p26).await.unwrap() as i16;
-        let last_button = adc_to_button(LAST_ADC.load(Ordering::Relaxed));
-        let cur_button = adc_to_button(level);
-        if cur_button != &Button::None && last_button == &Button::None {
-            handle_button(cur_button);
+        let button = buttons::wait_for_button(&mut adc, &mut pin).await;
+        let cur_mode = CURRENT_MODE_INDEX.load(Ordering::Relaxed);
+        match button {
+            Button::Up => {
+                CURRENT_MODE_INDEX.store(if cur_mode == 0 { 0 } else {cur_mode - 1}, Ordering::Relaxed)
+            }
+            Button::Down => {
+                CURRENT_MODE_INDEX.store(if cur_mode == 2 { 2 } else {cur_mode + 1} , Ordering::Relaxed)
+            }
+            Button::Left => {
+                CURRENT_SIDE_INDEX.store(1, Ordering::Relaxed)
+            }
+            Button::Right => {
+                CURRENT_SIDE_INDEX.store(0, Ordering::Relaxed)
+            }
+            Button::Center => {
+                RUNNING.store(!RUNNING.load(Ordering::Relaxed), Ordering::Relaxed)
+            }
+            Button::None => {}
         }
-        LAST_ADC.store(level, Ordering::Relaxed);
-
-        Timer::after_millis(10).await;
+        info!("Button pressed: {}", button);
     }
 }
 
 #[embassy_executor::task]
-async fn run_pwm(pwm_pin: peripherals::PIN_27, pwm_channel: peripherals::PWM_CH5) {
-
-    let mut c: pwm::Config = Default::default();
-    c.divider = 125.to_fixed();
-    c.top = 20000;
-    c.compare_b = 1500;
-    let mut pwm = pwm::Pwm::new_output_b(pwm_channel, pwm_pin, c.clone());
-
+async fn run_pwm() {
     loop {
-        //info!("current LED duty cycle: {}", c.compare_b);
-        Timer::after_millis(300).await;
+        Timer::after_millis(1500).await;
 
-        if c.compare_b < 2500 {
-            c.compare_b += 100;
-        } else {
-            c.compare_b = 500;
+        if RUNNING.load(Ordering::Relaxed) {
+            let side = CURRENT_SIDE_INDEX.load(Ordering::Relaxed);
+            CURRENT_SIDE_INDEX.store((side + 1) % 2, Ordering::Relaxed);
         }
-        pwm.set_config(&c);
     }
 }
 
-fn adc_to_button(adc_value: i16) -> &'static Button {
-    ADC_BUTTONS
-        .iter()
-        .min_by_key(|(comp_value, _)| (comp_value - adc_value).abs())
-        .map(|(_, button)| button)
-        .unwrap()
-}
-
-fn handle_button(button: &Button) {
-    info!("Button pressed: {}", button);
+async fn update_pwm () {
+    let mode = CURRENT_MODE_INDEX.load(Ordering::Relaxed);
+    let side = CURRENT_SIDE_INDEX.load(Ordering::Relaxed);
+    let mut pwn_unlocked = PWM.lock().await;
+    let mut pwn_config_unlocked = PWM_CONFIG.lock().await;
+    if let (Some(pwm), Some(config)) = (pwn_unlocked.as_mut(), pwn_config_unlocked.as_mut()) {
+        config.compare_b = MODES[mode][side];
+        pwm.set_config(config);
+    }
 }
